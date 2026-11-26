@@ -1,0 +1,240 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Mastermind Glitch</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #18181b; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; cursor: crosshair; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script src="image.js"></script>
+<script>
+// ---------- tweakables ----------
+const CFG = {
+  flowRadius: 0.18,     // size of the cursor's influence (fraction of height)
+  flowDecay: 0.94,      // how fast the warp trail fades (closer to 1 = longer trail)
+  warp: 0.09,           // UV displacement strength
+  rgbSplit: 0.025,      // chromatic offset along movement
+  pixelMax: 48.0,       // biggest pixel block size (px) at full intensity
+  sliceGlitch: 1.0,     // horizontal slice tearing amount
+};
+
+const canvas = document.getElementById('c');
+const gl = canvas.getContext('webgl', { antialias: false, premultipliedAlpha: false });
+
+const VERT = `
+attribute vec2 p; varying vec2 vUv;
+void main(){ vUv = p*0.5+0.5; gl_Position = vec4(p,0.,1.); }`;
+
+// Flow map: RG = velocity (encoded 0..1), B = intensity
+const FLOW_FRAG = `
+precision highp float; varying vec2 vUv;
+uniform sampler2D uPrev; uniform vec2 uMouse; uniform vec2 uVel;
+uniform float uAspect; uniform float uRadius; uniform float uDecay;
+void main(){
+  vec4 prev = texture2D(uPrev, vUv);
+  vec2 vel = (prev.rg - 0.5) * uDecay;
+  float inten = prev.b * uDecay;
+  vec2 d = vUv - uMouse; d.x *= uAspect;
+  float f = smoothstep(uRadius, 0.0, length(d));
+  float sp = clamp(length(uVel) * 18.0, 0.0, 1.0);
+  vel += uVel * f * 6.0;
+  inten = max(inten, f * sp);
+  gl_FragColor = vec4(clamp(vel,-0.5,0.5)+0.5, clamp(inten,0.,1.), 1.);
+}`;
+
+const MAIN_FRAG = `
+precision highp float; varying vec2 vUv;
+uniform sampler2D uImg; uniform sampler2D uFlow;
+uniform vec2 uRes; uniform vec2 uImgRes; uniform float uTime; uniform float uEnergy;
+uniform float uWarp; uniform float uSplit; uniform float uPix; uniform float uSlice;
+
+float hash(vec2 p){ return fract(sin(dot(p, vec2(127.1,311.7))) * 43758.5453); }
+
+// object-fit: cover
+vec2 coverUv(vec2 uv){
+  float sr = uRes.x/uRes.y, ir = uImgRes.x/uImgRes.y;
+  vec2 s = sr > ir ? vec2(1., ir/sr) : vec2(sr/ir, 1.);
+  return (uv - 0.5) * s + 0.5;
+}
+vec3 img(vec2 uv){ return texture2D(uImg, clamp(coverUv(uv), 0.001, 0.999)).rgb; }
+
+void main(){
+  vec2 uv = vUv;
+  vec4 fl = texture2D(uFlow, uv);
+  vec2 vel = fl.rg - 0.5;
+  float inten = fl.b;
+
+  // --- pixel blocks: quantize uv to random-sized blocks where intensity is high
+  float t = floor(uTime * 14.0);
+  float steps = floor(inten * 4.0);            // 0..4 levels
+  if (steps > 0.0) {
+    float bs = mix(4.0, uPix, steps/4.0) * (0.5 + hash(vec2(steps, t)));
+    vec2 cell = vec2(bs) / uRes;
+    vec2 q = (floor(uv / cell) + 0.5) * cell;
+    // re-sample flow at block centre so whole blocks move together
+    vec4 qf = texture2D(uFlow, q);
+    if (qf.b > 0.15) { uv = q; vel = qf.rg - 0.5; inten = qf.b; }
+  }
+
+  // --- horizontal slice tearing driven by global movement energy
+  float row = floor(vUv.y * mix(18.0, 60.0, hash(vec2(t, 2.0))));
+  float r = hash(vec2(row, t));
+  float tear = step(1.0 - uEnergy * 0.35 * uSlice, r) * (hash(vec2(row, t + 9.0)) - 0.5) * 0.12 * uEnergy;
+  uv.x += tear;
+
+  // --- warp
+  uv -= vel * uWarp * (0.6 + inten);
+
+  // --- RGB split along the flow direction
+  vec2 dir = vel * uSplit * 12.0 + vec2(tear * 0.4, 0.0);
+  float cr = img(uv + dir).r;
+  float cg = img(uv).g;
+  float cb = img(uv - dir).b;
+  vec3 col = vec3(cr, cg, cb);
+
+  // --- digital noise + scanlines in active areas
+  float n = hash(floor(vUv * uRes / 2.0) + t);
+  col += (n - 0.5) * 0.18 * inten;
+  col *= 1.0 - 0.08 * inten * step(0.5, fract(vUv.y * uRes.y / 3.0));
+
+  // occasional colour-inverted blocks on strong hits
+  vec2 blk = floor(vUv * uRes / 26.0);
+  if (inten > 0.6 && hash(blk + t) > 0.93) col = mix(col, 1.0 - col.gbr, 0.85);
+
+  gl_FragColor = vec4(col, 1.0);
+}`;
+
+function shader(type, src){
+  const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+  return s;
+}
+function program(fs){
+  const p = gl.createProgram();
+  gl.attachShader(p, shader(gl.VERTEX_SHADER, VERT));
+  gl.attachShader(p, shader(gl.FRAGMENT_SHADER, fs));
+  gl.bindAttribLocation(p, 0, 'p'); gl.linkProgram(p);
+  const u = {}; const n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+  for (let i = 0; i < n; i++){ const a = gl.getActiveUniform(p, i); u[a.name] = gl.getUniformLocation(p, a.name); }
+  return { p, u };
+}
+const flowProg = program(FLOW_FRAG);
+const mainProg = program(MAIN_FRAG);
+
+const buf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
+gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+
+function tex(w, h, data){
+  const t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, data);
+  return t;
+}
+
+// Flow map ping-pong (low-res is fine and looks smoother)
+const FLOW = 128;
+const neutral = new Uint8Array(FLOW * FLOW * 4);
+for (let i = 0; i < neutral.length; i += 4){ neutral[i] = 128; neutral[i+1] = 128; neutral[i+2] = 0; neutral[i+3] = 255; }
+const flow = [0, 1].map(() => {
+  const t = tex(FLOW, FLOW, neutral);
+  const fb = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t, 0);
+  return { t, fb };
+});
+gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+let imgTex = null, imgW = 1, imgH = 1;
+const image = new Image();
+image.onload = () => {
+  imgW = image.width; imgH = image.height;
+  imgTex = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, imgTex);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, image);
+  gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+};
+image.src = window.MASTERMIND_IMG;
+
+// Mouse
+const mouse = { x: 0.5, y: 0.5, px: 0.5, py: 0.5, vx: 0, vy: 0, has: false };
+let energy = 0;
+function onMove(cx, cy){
+  const r = canvas.getBoundingClientRect();
+  mouse.x = (cx - r.left) / r.width;
+  mouse.y = 1 - (cy - r.top) / r.height;
+  if (!mouse.has){ mouse.px = mouse.x; mouse.py = mouse.y; mouse.has = true; }
+}
+addEventListener('pointermove', e => onMove(e.clientX, e.clientY));
+addEventListener('touchmove', e => { const t = e.touches[0]; onMove(t.clientX, t.clientY); }, { passive: true });
+
+function resize(){
+  const dpr = Math.min(devicePixelRatio || 1, 2);
+  canvas.width = Math.round(innerWidth * dpr);
+  canvas.height = Math.round(innerHeight * dpr);
+}
+addEventListener('resize', resize); resize();
+
+let cur = 0;
+function frame(now){
+  requestAnimationFrame(frame);
+  const t = now / 1000;
+
+  // velocity this frame, smoothed
+  const dx = mouse.x - mouse.px, dy = mouse.y - mouse.py;
+  mouse.px = mouse.x; mouse.py = mouse.y;
+  mouse.vx += (dx - mouse.vx) * 0.5;
+  mouse.vy += (dy - mouse.vy) * 0.5;
+  const speed = Math.hypot(dx, dy);
+  energy = Math.max(energy * 0.92, Math.min(speed * 25, 1));
+
+  // 1) update flow map
+  const src = flow[cur], dst = flow[1 - cur];
+  gl.bindFramebuffer(gl.FRAMEBUFFER, dst.fb);
+  gl.viewport(0, 0, FLOW, FLOW);
+  gl.useProgram(flowProg.p);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, src.t);
+  gl.uniform1i(flowProg.u.uPrev, 0);
+  gl.uniform2f(flowProg.u.uMouse, mouse.x, mouse.y);
+  gl.uniform2f(flowProg.u.uVel, mouse.vx, mouse.vy);
+  gl.uniform1f(flowProg.u.uAspect, canvas.width / canvas.height);
+  gl.uniform1f(flowProg.u.uRadius, CFG.flowRadius);
+  gl.uniform1f(flowProg.u.uDecay, CFG.flowDecay);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  cur = 1 - cur;
+
+  // 2) draw image with glitch
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.viewport(0, 0, canvas.width, canvas.height);
+  if (!imgTex) return;
+  gl.useProgram(mainProg.p);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, imgTex);
+  gl.uniform1i(mainProg.u.uImg, 0);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, dst.t);
+  gl.uniform1i(mainProg.u.uFlow, 1);
+  gl.uniform2f(mainProg.u.uRes, canvas.width, canvas.height);
+  gl.uniform2f(mainProg.u.uImgRes, imgW, imgH);
+  gl.uniform1f(mainProg.u.uTime, t);
+  gl.uniform1f(mainProg.u.uEnergy, energy);
+  gl.uniform1f(mainProg.u.uWarp, CFG.warp);
+  gl.uniform1f(mainProg.u.uSplit, CFG.rgbSplit);
+  gl.uniform1f(mainProg.u.uPix, CFG.pixelMax);
+  gl.uniform1f(mainProg.u.uSlice, CFG.sliceGlitch);
+  gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
